@@ -33,4 +33,5 @@ let profiles = [
     "jsc": jscProfile,
     "spidermonkey": spidermonkeyProfile,
     "v8": v8Profile,
+    "qv4": qv4Profile,
 ]

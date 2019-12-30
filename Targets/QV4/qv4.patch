@@ -1,0 +1,258 @@
+diff --git a/tools/qmljs/qmljs.cpp b/tools/qmljs/qmljs.cpp
+index 4b581fff0..5bcbf1ca9 100644
+--- a/tools/qmljs/qmljs.cpp
++++ b/tools/qmljs/qmljs.cpp
+@@ -51,6 +51,143 @@
+ 
+ #include <iostream>
+ 
++#include <cstdlib>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++extern "C" {
++#include <fcntl.h>
++#include <sys/wait.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++}
++
++
++//
++// BEGIN FUZZING CODE
++//
++
++#define REPRL_CRFD 100
++#define REPRL_CWFD 101
++#define REPRL_DRFD 102
++#define REPRL_DWFD 103
++
++#define SHM_SIZE 0x100000
++#define MAX_EDGES ((SHM_SIZE - 4) * 8)
++
++#define CHECK(cond) if (!(cond)) { fprintf(stderr, "\"" #cond "\" failed\n"); _exit(-1); }
++
++struct shmem_data {
++    uint32_t num_edges;
++    unsigned char edges[];
++};
++
++struct shmem_data* __shmem;
++
++uint32_t *__edges_start, *__edges_stop;
++void __sanitizer_cov_reset_edgeguards() {
++    uint64_t N = 0;
++    for (uint32_t *x = __edges_start; x < __edges_stop && N < MAX_EDGES; x++)
++        *x = ++N;
++}
++
++extern "C" void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
++    // Avoid duplicate initialization
++    if (start == stop || *start)
++        return;
++
++    if (__edges_start != NULL || __edges_stop != NULL) {
++        fprintf(stderr, "Coverage instrumentation is only supported for a single module\n");
++        _exit(-1);
++    }
++
++    __edges_start = start;
++    __edges_stop = stop;
++
++    // Map the shared memory region
++    const char* shm_key = getenv("SHM_ID");
++    if (!shm_key) {
++        puts("[COV] no shared memory bitmap available, skipping");
++        __shmem = (struct shmem_data*) malloc(SHM_SIZE);
++    } else {
++        int fd = shm_open(shm_key, O_RDWR, S_IREAD | S_IWRITE);
++        if (fd <= -1) {
++            fprintf(stderr, "Failed to open shared memory region: %s\n", strerror(errno));
++            _exit(-1);
++        }
++
++        __shmem = (struct shmem_data*) mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        if (__shmem == MAP_FAILED) {
++            fprintf(stderr, "Failed to mmap shared memory region\n");
++            _exit(-1);
++        }
++    }
++
++    __sanitizer_cov_reset_edgeguards();
++
++    __shmem->num_edges = stop - start;
++    printf("[COV] edge counters initialized. Shared memory: %s with %u edges\n", shm_key, __shmem->num_edges);
++}
++
++extern "C" void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
++    if (!*guard) return;
++    uint32_t index = *guard - 1;
++    __shmem->edges[index / 8] |= 1 << (index % 8);
++    *guard = 0;
++}
++
++//
++// END FUZZING CODE
++//
++
++
++namespace Fuzzilli {
++
++void print(const char *message) {
++    static FILE* fzliout = fdopen(REPRL_DWFD, "w");
++    if (!fzliout) {
++        fprintf(stderr, "Fuzzer output channel not available, printing to stdout instead\n");
++        fzliout = stdout;
++    }
++    fprintf(fzliout, "%s\n", message);
++    fflush(fzliout);
++}
++
++// We have to assume that the fuzzer will be able to call this function e.g. by
++// enumerating the properties of the global object and eval'ing them. As such
++// this function is implemented in a way that requires passing some magic value
++// as first argument (with the idea being that the fuzzer won't be able to
++// generate this value) which then also acts as a selector for the operation
++// to perform.
++using namespace QV4;
++ReturnedValue method_fuzzilli(const FunctionObject * /* b */, const Value * /* thisObj */, const Value *argv, int argc) {
++    if (argc < 2)
++        return Encode::undefined();
++    QString operation = argv[0].toQString();
++    if (operation == "FUZZILLI_CRASH") {
++        int arg = argv[1].toInt32();
++        switch (arg) {
++            case 0:
++                *((int*)0x41414141) = 0x1337;
++                break;
++            case 1:
++                abort(); // No real release assert in Qt, so we use this :/
++                break;
++            default:
++                Q_ASSERT(false);
++                break;
++        }
++    } else if (operation == "FUZZILLI_PRINT") {
++        QString string = argv[1].toQString();
++        ::Fuzzilli::print(string.toStdString().c_str());
++    }
++    return Encode::undefined();
++}
++
++} // namespace Fuzzilli
++
+ static void showException(QV4::ExecutionContext *ctx, const QV4::Value &exception, const QV4::StackTrace &trace)
+ {
+     QV4::Scope scope(ctx);
+@@ -80,8 +217,18 @@ int main(int argc, char *argv[])
+     bool runAsQml = false;
+     bool runAsModule = false;
+     bool cache = false;
++    bool fuzzilliReprl = false;
+ 
+     if (!args.isEmpty()) {
++        if (args.constFirst() == QLatin1String("--reprl")) {
++            // Turn on the JIT earlier, we don't want the fuzzer to have to generate massive for loops...
++            // This is just pilfered from --jit.
++            qputenv("QV4_JIT_CALL_THRESHOLD", QByteArray("10"));
++            // Enable REPRL if requested
++            fuzzilliReprl = true;
++            args.removeFirst();
++            // Since we won't have another argument, stop option processing here.
++        } else { // Not indented to keep the diff clean
+         if (args.constFirst() == QLatin1String("--jit")) {
+             qputenv("QV4_JIT_CALL_THRESHOLD", QByteArray("0"));
+             args.removeFirst();
+@@ -110,15 +257,90 @@ int main(int argc, char *argv[])
+             std::cerr << "Usage: qmljs [|--jit|--interpret|--qml] file..." << std::endl;
+             return EXIT_SUCCESS;
+         }
++        }
+     }
+ 
+     QV4::ExecutionEngine vm;
++    if (fuzzilliReprl)
++        vm.globalObject->defineDefaultProperty(QStringLiteral("fuzzilli"), Fuzzilli::method_fuzzilli, 1);
+ 
+     QV4::Scope scope(&vm);
+     QV4::ScopedContext ctx(scope, vm.rootContext());
+ 
+     QV4::GlobalExtensions::init(vm.globalObject, QJSEngine::ConsoleExtension | QJSEngine::GarbageCollectionExtension);
+ 
++    if (fuzzilliReprl) {
++        // Let parent know we are ready
++        char helo[] = "HELO";
++        if (write(REPRL_CWFD, helo, 4) != 4 ||
++            read(REPRL_CRFD, helo, 4) != 4) {
++            fuzzilliReprl = false;
++        }
++
++        if (memcmp(helo, "HELO", 4) != 0) {
++            fprintf(stderr, "Invalid response from parent\n");
++            return EXIT_FAILURE;
++        }
++        QV4::ScopedValue result(scope);
++
++        while (fuzzilliReprl) {
++            unsigned action = 0;
++            ssize_t nread = read(REPRL_CRFD, &action, 4);
++            if (nread != 4 || action != 'cexe') {
++                fprintf(stderr, "Unknown action: %u\n", action);
++                return EXIT_FAILURE;
++            }
++
++            QScopedPointer<QV4::Script> script;
++            size_t script_size;
++            if (read(REPRL_CRFD, &script_size, 8) != 8) {
++                fprintf(stderr, "Read failed\n");
++                return EXIT_FAILURE;
++            }
++
++            char *buffer = new char[script_size + 1];
++            char *ptr = buffer;
++            size_t remaining = script_size;
++            while (remaining > 0) {
++                ssize_t rv = read(REPRL_DRFD, ptr, remaining);
++                if (rv < 0) {
++                    fprintf(stderr, "Read failed\n");
++                    return EXIT_FAILURE;
++                }
++                remaining -= rv;
++                ptr += rv;
++            }
++            buffer[script_size] = 0;
++
++            bool success = false;
++            const QString code = QString::fromUtf8(buffer, script_size);
++            script.reset(new QV4::Script(ctx, QV4::Compiler::ContextType::Global, code, QString("fuzzcode.js")));
++            script->parseAsBinding = false;
++            script->parse();
++            delete[] buffer;
++
++            if (!scope.engine->hasException) {
++                result = script->run();
++                if (scope.engine->hasException) {
++                    QV4::StackTrace trace;
++                    QV4::ScopedValue ex(scope, scope.engine->catchException(&trace));
++                    showException(ctx, ex, trace);
++                } else {
++                    success = true;
++                }
++            }
++            int status = (success ? 0 : 3) << 8; // unclear what this is exactly, but this mimics the JSC code so it should be fine...
++            // TODO: should we ever break here if we have success == false?
++            if (write(REPRL_CWFD, &status, 4) != 4) {
++                fprintf(stderr, "Write failed.\n");
++                return EXIT_FAILURE;
++            }
++            __sanitizer_cov_reset_edgeguards();
++        }
++
++        return EXIT_SUCCESS;
++    }
++
+     for (const QString &fn : qAsConst(args)) {
+         QV4::ScopedValue result(scope);
+         if (runAsModule) {
